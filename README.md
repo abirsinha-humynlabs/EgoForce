@@ -287,6 +287,102 @@ python demo/run_app.py --server-name 0.0.0.0 --server-port 7860
 python demo/run_app.py --share
 ```
 
+### Hand landmark video export
+
+[demo/render_landmarks.py](demo/render_landmarks.py) is a headless CLI that runs EgoForce over a
+video file and writes two things:
+
+- an overlay mp4 with the 21-joint hand skeleton drawn on the input frames, and
+- an `.npz` holding the camera-space 3D joints, their 2D projections and per-hand
+  visibility flags for every processed frame.
+
+It needs neither Gradio nor the pytorch3d rasteriser (the overlay is drawn with OpenCV
+from `pred_j2d`), so it is the lighter path when you want keypoints rather than meshes.
+
+Minimal run on an uncalibrated video — intrinsics are estimated from the first processed
+frame with AnyCalib, exactly as the Gradio demo does:
+
+```bash
+python demo/render_landmarks.py \
+  --video /path/to/input.mp4 \
+  --duration-seconds 10
+```
+
+Outputs default to `_DATA/outputs/<video stem>_landmarks.{mp4,npz}`.
+
+If the rig is already calibrated, pass the intrinsics and skip AnyCalib entirely:
+
+```bash
+python demo/render_landmarks.py \
+  --video /path/to/input.mp4 \
+  --camera-model pinhole \
+  --focal 736.6 736.6 \
+  --principal 960.0 540.0
+```
+
+`--camera-model` accepts `pinhole`, `rational8` (8 distortion coefficients) and
+`fisheye624` (12 coefficients); pass the coefficients with `--distortion`. Without
+`--camera-model`, `--lens` selects the AnyCalib lens model (`fisheye624`,
+`pinhole_distortion` or `pinhole`).
+
+Other useful flags:
+
+- `--start-seconds` / `--duration-seconds` / `--max-frames` / `--stride` select the clip.
+  Output fps is divided by `--stride`.
+- `--draw-forearm` also draws the predicted 3-joint forearm chain.
+- `--skip-video` dumps only the keypoint npz.
+- `--no-kalman` disables the translation Kalman filter (enabled by default, and its
+  frequency is set from the source fps).
+- `--no-undistort-inp` matches the `--no-undistort-inp` evaluation ablation.
+- `--verbose` lets the per-frame timing prints through.
+
+#### Keypoint npz layout
+
+`N` is the number of processed frames; the hand axis is `['left', 'right']`.
+
+| Key | Shape | Meaning |
+| --- | --- | --- |
+| `j3d` | `(N, 2, 21, 3)` | Camera-space hand joints, metres |
+| `j2d` | `(N, 2, 21, 2)` | Hand joints projected to source-image pixels |
+| `arm_j3d` | `(N, 2, 3, 3)` | Camera-space forearm joints, metres |
+| `arm_j2d` | `(N, 2, 3, 2)` | Forearm joints in source-image pixels |
+| `visible` | `(N, 2)` | Per-hand detection flag |
+| `failed` | `(N,)` | True where inference raised on that frame |
+| `frame_index` | `(N,)` | Index in the source video |
+| `timestamp_s` | `(N,)` | Source timestamp in seconds |
+| `joint_names` | `(21,)` | Joint names in output order |
+| `skeleton_edges` | `(23, 2)` | Joint-index pairs for drawing |
+| `calibration` | scalar | JSON string with the intrinsics actually used |
+
+Frames where a hand is not detected are filled with `NaN` and flagged in `visible`.
+
+The joint order follows `mano_joint_mapping` in [models/mano_layer.py](models/mano_layer.py):
+wrist first, then thumb, index, middle, ring and pinky, each running MCP → PIP → DIP → tip.
+
+#### Requirements
+
+This script has the same hard requirements as the rest of the demo — an NVIDIA GPU with
+CUDA. `demo/inference.py` imports `torch_tensorrt` and compiles both the detector and
+HALO for TensorRT, and [scripts/install.sh](scripts/install.sh) pins CUDA 12.6, so there
+is no CPU or Apple-silicon path.
+
+- NVIDIA GPU with a CUDA 12.6 capable driver. The repo does not document a VRAM
+  figure. The work per frame is small and fixed — RTMDet-tiny plus a YOLO pose
+  detector on the full frame, then HALO on four `224x224` crops (hand and forearm
+  for each hand) — so VRAM is dominated by the TensorRT and inductor
+  `max-autotune` compilation rather than by inference itself. Anything from
+  roughly 12 GB up should be comfortable; treat that as an estimate, not a
+  measured requirement.
+- The environment from `bash scripts/install.sh` (Python 3.10, PyTorch 2.8 + cu126,
+  torch-TensorRT 2.8, mmcv 2.1.0, mmdetection, pytorch3d, AnyCalib).
+- Weights from `bash scripts/download_model_weights.sh`, which populates `_DATA/` with
+  `model_weights.pth`, the detector checkpoints and the MANO files.
+- `ffmpeg` on `PATH` for h264 output. Without it the script falls back to OpenCV's
+  `mp4v` encoder.
+
+The first invocation pays a one-off TensorRT/inductor compile before the first frame is
+produced.
+
 ### Project Aria live demo
 
 The live Aria demo in [demo/run_aria.py](demo/run_aria.py) streams RGB frames from a Project Aria device and runs inference frame by frame. The same entrypoint supports both USB and Wi-Fi streaming.
