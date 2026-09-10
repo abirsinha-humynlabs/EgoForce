@@ -7,6 +7,9 @@ and add a fusion that jointly optimises articulation rather than rigidly re-posi
 `fusion/selftest.py` (34 checks, all passing). EgoForce inference, RTMPose inference and the MANO
 forward pass are untested — see [`../plan_of_action.md`](../plan_of_action.md).
 
+This file is the quick orientation. For the design rationale, the refit objective, the full data
+contracts and what was verified how, read [`../PIPELINE.md`](../PIPELINE.md).
+
 ## The one fact that makes this work
 
 All three models emit **the same 21 keypoints in the same order** — wrist, then thumb, index, middle,

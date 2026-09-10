@@ -383,6 +383,23 @@ is no CPU or Apple-silicon path.
 The first invocation pays a one-off TensorRT/inductor compile before the first frame is
 produced.
 
+### Evaluation and 2D/3D fusion (`fusion/`)
+
+The [`fusion/`](fusion) package runs EgoForce as a drop-in replacement for the WiLoR + MediaPipe
+stages of an existing egocentric hand-labelling pipeline, and adds a fusion with RTMPose-m Hand5 that
+refits MANO articulation against confidence-weighted 2D landmarks instead of rigidly re-posing a
+fixed skeleton.
+
+| Document | Read it for |
+| --- | --- |
+| [`fusion/README.md`](fusion/README.md) | How to run it — stage map and commands |
+| [`PIPELINE.md`](PIPELINE.md) | Design and engineering: why it is shaped this way, the refit objective, the data contracts, what was verified how |
+| [`plan_of_action.md`](plan_of_action.md) | What is still pending, the GPU requirement, and the known issues that affect the comparison |
+
+`python fusion/selftest.py` runs 34 checks with no GPU, no checkpoints and no MANO files. The
+producer stages themselves have the same CUDA requirement as the rest of the demo, and additionally
+need `mim install "mmpose>=1.3.2"` plus `bash scripts/download_rtmpose_hand5.sh`.
+
 ### Project Aria live demo
 
 The live Aria demo in [demo/run_aria.py](demo/run_aria.py) streams RGB frames from a Project Aria device and runs inference frame by frame. The same entrypoint supports both USB and Wi-Fi streaming.

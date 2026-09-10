@@ -38,8 +38,9 @@ two rather than pretend to fix them.
 
 ## 2. What is done
 
-Everything is on `feat/egoforce-rtmpose-fusion`. See [`fusion/README.md`](fusion/README.md) for how
-the stages connect.
+Everything is on `feat/egoforce-rtmpose-fusion`. [`fusion/README.md`](fusion/README.md) is the quick
+orientation; [`PIPELINE.md`](PIPELINE.md) is the design and engineering document — what was built,
+why it is shaped that way, the data contracts, and what was verified versus assumed.
 
 | Component | File | Notes |
 | --- | --- | --- |
