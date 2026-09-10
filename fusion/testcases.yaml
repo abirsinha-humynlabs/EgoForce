@@ -1,0 +1,112 @@
+# Test matrix for the EgoForce evaluation.
+#
+# Run with:
+#   python fusion/run_testcases.py --config fusion/testcases.yaml --dry-run   # print the commands
+#   python fusion/run_testcases.py --config fusion/testcases.yaml             # actually run
+#   python fusion/run_testcases.py --config fusion/testcases.yaml --case T2b_articulated
+#
+# ---------------------------------------------------------------------------------------------
+# EDIT THE `clips:` BLOCK BEFORE RUNNING. The paths below are placeholders and the runner will
+# refuse to start until they point at real files. Intrinsics are NOT guessed: give either
+# `calib:` (a Standard Package calibration.json) or `K: [fx, fy, cx, cy]`. Getting these wrong
+# does not fail loudly - it biases every 3D point, which is why the 3D stage warns when cx is
+# far from W/2.
+# ---------------------------------------------------------------------------------------------
+
+clips:
+  - name: EDIT_ME_clip_a
+    video: /path/to/normalized/clip_a/video_rectified.mp4
+    calib: /path/to/normalized/clip_a/calibration.json
+    # K: [736.6, 736.6, 928.57, 540.0]      # alternative to calib
+    start_sec: 0.0
+    duration_sec: 20.0
+    notes: >
+      Pick clips where the CURRENT pipeline visibly fails, not clips where it already works.
+      The comparison is only informative on the difficult cases: fast motion, a hand gripping a
+      tool seen from the back, both hands crossing, and at least one clip that produced a foot
+      false positive.
+
+  # - name: EDIT_ME_clip_b_foot_fp
+  #   video: /path/to/normalized/clip_b/video_rectified.mp4
+  #   calib: /path/to/normalized/clip_b/calibration.json
+  #   duration_sec: 20.0
+  #   notes: The clip that tracked a foot as a hand.
+
+# Uncalibrated footage (e.g. a YouTube egocentric clip) has no rectified pinhole K, so it does not
+# belong in this matrix. For a quick look at one of those use the standalone viewer, which estimates
+# intrinsics with AnyCalib:
+#   python demo/render_landmarks.py --video <file> --duration-seconds 10
+
+defaults:
+  sample_fps: 0            # 0 = every frame
+  overlay: true
+
+cases:
+  # ------------------------------------------------------------------ Experiment 1
+  - id: T1_egoforce_only
+    question: >
+      Does swapping WiLoR for EgoForce improve difficult poses and camera-space placement at all?
+      This is the baseline every other row is judged against.
+    stages: [egoforce_3d, fuse]
+    egoforce_3d: {}
+    fuse: {mode: egoforce-only}
+
+  - id: T1b_egoforce_no_kalman
+    question: >
+      How much of EgoForce's apparent stability is the translation Kalman filter rather than the
+      model? Matters because the filter also delays reacquisition after an occlusion, which shows
+      up as recovery delay.
+    stages: [egoforce_3d, fuse]
+    egoforce_3d: {no_kalman: true}
+    fuse: {mode: egoforce-only}
+
+  - id: T1c_egoforce_recall
+    question: >
+      Are missing hands a DETECTION problem or a pose problem? Loosens the hand-detector floor and
+      lets a track survive longer without a detection. If coverage jumps here, the fix is in
+      detection/association, not in the pose model.
+    stages: [egoforce_3d, fuse]
+    egoforce_3d: {hand_conf: 0.15, max_misses: 6}
+    fuse: {mode: egoforce-only}
+
+  # ------------------------------------------------------------------ Experiment 2
+  - id: T2a_rtmpose_rigid
+    question: >
+      Isolates the MODEL SWAP from the FUSION CHANGE: EgoForce 3D + RTMPose 2D through the existing
+      rigid-PnP fusion, unmodified. If T2b beats this, the articulated refit is what helped; if it
+      does not, the refit is not earning its complexity.
+    requires_mono_pipeline: true
+    stages: [egoforce_3d, rtmpose_2d, fuse_rigid]
+    egoforce_3d: {}
+    rtmpose_2d: {boxes: npz}
+    fuse_rigid: {fusion: pnp, pnp_max_px: 25.0}
+
+  - id: T2b_articulated
+    question: >
+      The actual proposal: refit MANO articulation against RTMPose's confidence-weighted landmarks.
+      This is the only variant that can correct a wrongly bent finger.
+    stages: [egoforce_3d, rtmpose_2d, fuse]
+    egoforce_3d: {}
+    rtmpose_2d: {boxes: npz}
+    fuse: {mode: articulated}
+
+  - id: T2c_articulated_loose
+    question: >
+      Sensitivity check on the priors. Trusts the image evidence more and EgoForce's articulation
+      less. If accuracy improves AND bone_cv / depth-change stay flat, the default priors are too
+      stiff; if the hand starts breathing, they are not.
+    stages: [egoforce_3d, rtmpose_2d, fuse]
+    egoforce_3d: {}
+    rtmpose_2d: {boxes: npz}
+    fuse: {mode: articulated, w_pose: 1.0, w_orient: 2.0, w_reproj: 2.0}
+
+  - id: T2d_articulated_indep_detector
+    question: >
+      Does an independent hand detector change the foot false positives and the recall? With
+      `boxes: npz` both streams inherit EgoForce's boxes, so a foot detected once is a foot in both.
+      NEEDS --det-config/--det-checkpoint for an mmdet hand detector; skipped otherwise.
+    requires_detector: true
+    stages: [egoforce_3d, rtmpose_2d, fuse]
+    egoforce_3d: {}
+    rtmpose_2d: {boxes: mmdet}
+    fuse: {mode: articulated}

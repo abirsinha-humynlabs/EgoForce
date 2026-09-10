@@ -140,6 +140,12 @@ def infer(self, config, model, limb_model, left_data, right_data, device):
     pred_j2d = self.camera_model.camera_to_uv(pred_j3d.cpu().numpy())
     pred_arm_j2d_proj = self.camera_model.camera_to_uv(pred_arm_j3d.cpu().numpy())
 
+    # The network's own 2D keypoint head, mapped from crop space to full-image pixels. This is an
+    # observation independent of the 3D lift (pred_j2d above is just pred_j3d projected), which is
+    # what a 2D/3D fusion stage needs. Exact for a rectified pinhole input; for a distorted camera
+    # the crop-to-image map is linear, so treat it as approximate there.
+    pred_hand_j2d_head = get_j2d_from_kpt2d(config, meta, pred_kpts_2d, pred_type='hand').cpu().numpy()
+
     pred_arm_j2d = get_j2d_from_kpt2d(config, meta, pred_arm_kpts_2d, pred_type='arm').cpu().numpy()
     pred_arm_j2d[:, [0, -1]] = pred_arm_j2d_proj[:, [0, -1]]
 
@@ -160,7 +166,9 @@ def infer(self, config, model, limb_model, left_data, right_data, device):
     pred_arm_kpt_w = pred_arm_kpt_w.cpu().numpy()
 
     pred_hand_type = pred_hand_type.squeeze(0).cpu().numpy()
-    
+
+    B = pred_betas.shape[0]
+
     return {
         'hand_crop': hand_crop,
         'arm_crop': arm_crop,
@@ -171,6 +179,20 @@ def infer(self, config, model, limb_model, left_data, right_data, device):
         'pred_arm_j2d': pred_arm_j2d,
         'pred_arm_vertices': pred_arm_vertices,
         'visible_hand': visible_hand.astype(bool).reshape(-1),
+
+        # --- additive: everything a downstream fusion / refit stage needs. Nothing above changed,
+        # so run_app.py, run_aria.py and renderer.py are unaffected.
+        'pred_hand_j2d_head': pred_hand_j2d_head,          # (B,21,2) network 2D head, image pixels
+        'pred_hand_kpt_conf': pred_hand_kpt_w,             # (B,21)   per-joint confidence
+        'pred_arm_kpt_conf': pred_arm_kpt_w,               # (B,3)
+        'pred_betas': pred_betas.reshape(B, -1).cpu().numpy(),            # (B,10)
+        'pred_global_orient': pred_global_orient.reshape(B, -1).cpu().numpy(),  # (B,6) 6D rotation
+        'pred_hand_pose': pred_hand_pose.reshape(B, -1).cpu().numpy(),    # (B,90) 15 joints x 6D
+        'pred_transl': pred_transl.reshape(B, -1).cpu().numpy(),          # (B,3) metres, camera frame
+        'hand_bbox': meta['hand_bbox'].reshape(B, -1).cpu().numpy(),      # (B,4) xyxy, source pixels
+        'arm_bbox': meta['arm_bbox'].reshape(B, -1).cpu().numpy(),        # (B,4)
+        'visible_arm': visible_arm.astype(bool).reshape(-1),              # (B,)
+        'hand_type': pred_hand_type.reshape(-1).astype(np.int8),          # (B,) 0=left, 1=right
     }
 
  

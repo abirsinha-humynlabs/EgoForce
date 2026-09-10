@@ -48,8 +48,6 @@ import argparse
 import contextlib
 import io
 import json
-import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -59,44 +57,14 @@ import torch
 from tqdm import tqdm
 
 from camera_models import OVR624CameraModel, PinholeCameraModel, Rational8CameraModel
+from fusion.topology import (HAND_ORDER, JOINT_NAMES, NUM_ARM_JOINTS, NUM_HAND_JOINTS,
+                             draw_forearm, draw_hand, skeleton_edges)
+from fusion.video_io import OverlayVideoWriter
 
 
-# ---------------------------------------------------------------------------
-# Joint layout
-#
-# ``models/mano_layer.py`` remaps the MANO joints through
-# ``mano_joint_mapping = [0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20]``
-# with fingertips appended in the order thumb, index, middle, ring, pinky. That
-# lands on the usual 21-joint hand layout: wrist first, then each finger from
-# MCP out to the tip.
-# ---------------------------------------------------------------------------
-
-JOINT_NAMES = [
-    'wrist',
-    'thumb_mcp', 'thumb_pip', 'thumb_dip', 'thumb_tip',
-    'index_mcp', 'index_pip', 'index_dip', 'index_tip',
-    'middle_mcp', 'middle_pip', 'middle_dip', 'middle_tip',
-    'ring_mcp', 'ring_pip', 'ring_dip', 'ring_tip',
-    'pinky_mcp', 'pinky_pip', 'pinky_dip', 'pinky_tip',
-]
-
-# (name, joint chain, BGR colour)
-FINGER_CHAINS = [
-    ('thumb', (0, 1, 2, 3, 4), (60, 76, 231)),
-    ('index', (0, 5, 6, 7, 8), (49, 176, 243)),
-    ('middle', (0, 9, 10, 11, 12), (72, 201, 116)),
-    ('ring', (0, 13, 14, 15, 16), (219, 152, 52)),
-    ('pinky', (0, 17, 18, 19, 20), (182, 89, 155)),
-]
-
-PALM_CHAIN = (5, 9, 13, 17)
-PALM_COLOR = (190, 190, 190)
-
-HAND_ORDER = ['left', 'right']
-HAND_LABEL_COLORS = {'left': (255, 214, 120), 'right': (140, 210, 255)}
-
-NUM_HAND_JOINTS = 21
-NUM_ARM_JOINTS = 3
+# The 21-joint layout, the skeleton and the drawing helpers live in fusion/topology.py, which
+# documents how the order was derived from models/mano_layer.py and why RTMPose and MediaPipe agree
+# with it. Kept in one place so this viewer and the fusion stages cannot drift apart.
 
 ANYCALIB_LENS_SPECS = {
     'fisheye624': {
@@ -118,15 +86,6 @@ ANYCALIB_LENS_SPECS = {
         'repo_camera': 'pinhole',
     },
 }
-
-
-def skeleton_edges():
-    """Return the (E, 2) joint-index pairs used to draw the hand skeleton."""
-    edges = []
-    for _, chain, _ in FINGER_CHAINS:
-        edges.extend(zip(chain[:-1], chain[1:]))
-    edges.extend(zip(PALM_CHAIN[:-1], PALM_CHAIN[1:]))
-    return np.asarray(edges, dtype=np.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -284,138 +243,6 @@ def camera_model_from_args(args, width, height):
 # ---------------------------------------------------------------------------
 # Video IO
 # ---------------------------------------------------------------------------
-
-class OverlayVideoWriter:
-    """Write BGR frames to an mp4, preferring an ffmpeg h264 pipe.
-
-    OpenCV's bundled ``mp4v`` encoder is used as a fallback when ffmpeg is not
-    on PATH; it works but produces files some players refuse to scrub.
-    """
-
-    def __init__(self, path, width, height, fps):
-        self.path = str(path)
-        self.width = int(width)
-        self.height = int(height)
-        self.fps = float(fps)
-        self.proc = None
-        self.writer = None
-
-        ffmpeg = shutil.which('ffmpeg')
-        if ffmpeg is not None:
-            cmd = [
-                ffmpeg, '-y',
-                '-loglevel', 'error',
-                '-f', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{self.width}x{self.height}',
-                '-r', f'{self.fps:.6f}',
-                '-i', '-',
-                '-an',
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '18',
-                '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart',
-                self.path,
-            ]
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            self.backend = 'ffmpeg/libx264'
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.writer = cv2.VideoWriter(self.path, fourcc, self.fps, (self.width, self.height))
-            if not self.writer.isOpened():
-                raise RuntimeError(f"Could not open an OpenCV VideoWriter for {self.path}.")
-            self.backend = 'opencv/mp4v'
-
-    def write(self, frame_bgr):
-        if frame_bgr.shape[0] != self.height or frame_bgr.shape[1] != self.width:
-            frame_bgr = cv2.resize(frame_bgr, (self.width, self.height))
-        frame_bgr = np.ascontiguousarray(frame_bgr, dtype=np.uint8)
-        if self.proc is not None:
-            self.proc.stdin.write(frame_bgr.tobytes())
-        else:
-            self.writer.write(frame_bgr)
-
-    def close(self):
-        if self.proc is not None:
-            self.proc.stdin.close()
-            self.proc.wait()
-            self.proc = None
-        if self.writer is not None:
-            self.writer.release()
-            self.writer = None
-
-
-# ---------------------------------------------------------------------------
-# Drawing
-# ---------------------------------------------------------------------------
-
-def _finite_point(xy, width, height, margin=64):
-    """Return an int pixel tuple, or None when the point is unusable."""
-    if not np.all(np.isfinite(xy)):
-        return None
-    x, y = float(xy[0]), float(xy[1])
-    if x < -margin or y < -margin or x > width + margin or y > height + margin:
-        return None
-    return int(round(x)), int(round(y))
-
-
-def draw_hand(frame_bgr, j2d, hand_name, line_thickness=2, joint_radius=3, draw_palm=True):
-    """Draw one 21-joint hand skeleton onto a BGR frame in place."""
-    height, width = frame_bgr.shape[:2]
-    points = [_finite_point(j2d[i], width, height) for i in range(NUM_HAND_JOINTS)]
-    is_left = hand_name == 'left'
-
-    if draw_palm:
-        for a, b in zip(PALM_CHAIN[:-1], PALM_CHAIN[1:]):
-            if points[a] is not None and points[b] is not None:
-                cv2.line(frame_bgr, points[a], points[b], PALM_COLOR, max(1, line_thickness - 1), cv2.LINE_AA)
-
-    for _, chain, color in FINGER_CHAINS:
-        for a, b in zip(chain[:-1], chain[1:]):
-            if points[a] is not None and points[b] is not None:
-                cv2.line(frame_bgr, points[a], points[b], color, line_thickness, cv2.LINE_AA)
-
-    for _, chain, color in FINGER_CHAINS:
-        for idx in chain[1:]:
-            pt = points[idx]
-            if pt is None:
-                continue
-            cv2.circle(frame_bgr, pt, joint_radius, color, -1, cv2.LINE_AA)
-            if not is_left:
-                # Right-hand joints get an outer ring so the two hands stay
-                # distinguishable where they overlap.
-                cv2.circle(frame_bgr, pt, joint_radius + 2, (255, 255, 255), 1, cv2.LINE_AA)
-
-    wrist = points[0]
-    if wrist is not None:
-        label_color = HAND_LABEL_COLORS[hand_name]
-        cv2.circle(frame_bgr, wrist, joint_radius + 3, label_color, -1, cv2.LINE_AA)
-        cv2.circle(frame_bgr, wrist, joint_radius + 5, (20, 20, 20), 1, cv2.LINE_AA)
-        cv2.putText(
-            frame_bgr, 'L' if is_left else 'R',
-            (wrist[0] + 10, wrist[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 3, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame_bgr, 'L' if is_left else 'R',
-            (wrist[0] + 10, wrist[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 1, cv2.LINE_AA,
-        )
-
-
-def draw_forearm(frame_bgr, arm_j2d, line_thickness=2):
-    """Draw the 3-joint forearm chain onto a BGR frame in place."""
-    height, width = frame_bgr.shape[:2]
-    points = [_finite_point(arm_j2d[i], width, height) for i in range(min(NUM_ARM_JOINTS, len(arm_j2d)))]
-    color = (150, 150, 150)
-    for a in range(len(points) - 1):
-        if points[a] is not None and points[a + 1] is not None:
-            cv2.line(frame_bgr, points[a], points[a + 1], color, line_thickness, cv2.LINE_AA)
-    for pt in points:
-        if pt is not None:
-            cv2.circle(frame_bgr, pt, line_thickness + 1, color, -1, cv2.LINE_AA)
-
 
 def draw_hud(frame_bgr, frame_index, timestamp_s, j3d, visible, failed=False):
     """Draw a small status readout: frame, time, per-hand wrist depth."""
