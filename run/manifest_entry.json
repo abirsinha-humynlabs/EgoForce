@@ -1,0 +1,10 @@
+[
+  {
+    "clip": "episode_047_egoforce",
+    "run_type": "egoforce only",
+    "with_filter": false,
+    "head_key": "labelling_results/6dof_head_pose_v2/home_episode_047/head_pose_6dof.npz",
+    "npz_key": "labelling_results/hand_pose_EgoForce/episode_047/type1_egoforce_only/episode_047_hand21_keypoints.npz",
+    "input_dir": "validation-result/ZED/home/episode_047/"
+  }
+]
