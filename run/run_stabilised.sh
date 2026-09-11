@@ -64,7 +64,12 @@ ffmpeg -y -loglevel error -i "$WORK/render/left_eye_wrist_traj_panels.mp4" \
     "$WORK/render/${CLIP}_${DST_RUN}_wrist_traj_panels.mp4"
 
 # ---------------------------------------------------------------- the three metrics
-python "$REPO/fusion/evaluate_run.py" --run "${DST_RUN}=$WORK/out" --out "$WORK/eval"
+# M3 needs an independent 2D reference. A type 1 run never produced one, so point EVAL_RTMPOSE at a
+# type 2 run's *_2d_keypoints.npz to score both against the SAME observation - otherwise M3 is blank
+# for type 1 and populated for type 2, and the two columns are not comparable.
+EVAL_ARG=()
+[[ -n "${EVAL_RTMPOSE:-}" ]] && EVAL_ARG=(--rtmpose "$EVAL_RTMPOSE")
+python "$REPO/fusion/evaluate_run.py" --run "${DST_RUN}=$WORK/out" --out "$WORK/eval" "${EVAL_ARG[@]}"
 
 # ---------------------------------------------------------------- upload
 if [[ "${NO_UPLOAD:-0}" == "1" ]]; then
