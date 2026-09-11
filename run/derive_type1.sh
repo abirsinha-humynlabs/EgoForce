@@ -29,9 +29,17 @@ echo "clip=${CLIP}  ${SRC_RUN} -> ${DST_RUN}  (no GPU)"
 echo "repo=${REPO}  commit=$(git -C "$REPO" rev-parse --short HEAD)"
 
 [[ -f "$SRC/out/${CLIP}_3d_keypoints.npz" ]] || { echo "no 3D npz at $SRC/out"; exit 1; }
-mkdir -p "$WORK/out" "$WORK/render" "$WORK/eval"
+mkdir -p "$WORK/out" "$WORK/render" "$WORK/eval" "$WORK/input"
 
 cp "$SRC/out/${CLIP}_3d_keypoints.npz" "$SRC/out/${CLIP}_3d_meta.json" "$WORK/out/"
+
+# Link the source run's staged inputs into this one. Without them the derived run directory is not
+# self-contained and anything downstream that expects a complete run - run/run_stabilised.sh, which
+# needs the video to re-render - refuses it with "source run has no staged video". Symlinks, not
+# copies: left_eye.mp4 alone is 200-265 MB and there is no reason to hold two.
+for f in left_eye.mp4 calibration.json head_pose_6dof.npz imu_accel.csv; do
+    [[ -f "$SRC/input/$f" ]] && ln -sf "$SRC/input/$f" "$WORK/input/$f"
+done
 
 # egoforce-only: no 2D model, nothing to match. Every row is source='wilor' with measured depth.
 python "$REPO/fusion/fuse_egoforce_rtmpose.py" \
