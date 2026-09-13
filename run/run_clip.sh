@@ -121,14 +121,36 @@ PY
 # what with_filter=false in the manifest entry selects.
 mkdir -p "$WORK/render"
 BUCKET="stage-humyn-egocentric-stereo-data"
-# Derive the head-pose key from CLIP. Reading it out of manifest_entry.json (which pins one clip)
-# meant `CLIP=episode_048 ./run/run_clip.sh` silently fetched episode_047's head trajectory and
-# rendered another clip's hands against it - wrong panels, no error. The manifest entry stays as the
-# delivery record; it is not the source of truth for which head pose to fetch.
-HEAD_KEY="${HEAD_KEY:-labelling_results/6dof_head_pose_v2/home_${CLIP}/head_pose_6dof.npz}"
+# Resolve the head-pose key by DISCOVERY, not by pattern.
+#
+# It came from manifest_entry.json originally, which pins one clip, so CLIP=episode_048 silently
+# fetched episode_047's head trajectory and rendered another clip's hands against it - wrong panels,
+# no error. Deriving it as home_<clip> fixed that pair and is still wrong in general, because the
+# layout under 6dof_head_pose_v2/ does not mirror the input path:
+#
+#   ZED/home/episode_047    -> home_episode_047
+#   ZED/others/episode_002  -> others_episode_002
+#   ZED/home/episode_009    -> unknown_episode_009     <- group does NOT match the input path
+#
+# and most of that bucket is free-form (blr_06_07_home_chopping_onion_87/ and 200-odd siblings).
+# There is no derivation that holds, so search for the directory ending in _<clip> and demand
+# exactly one. Zero or several is an error worth stopping on - silently rendering against another
+# clip's head trajectory is the failure this whole block exists to prevent.
+if [[ -z "${HEAD_KEY:-}" ]]; then
+    mapfile -t HEAD_CANDS < <(aws s3 ls "s3://${BUCKET}/labelling_results/6dof_head_pose_v2/" \
+        | awk '{print $2}' | grep -E "_${CLIP}/$" || true)
+    if [[ ${#HEAD_CANDS[@]} -eq 1 ]]; then
+        HEAD_KEY="labelling_results/6dof_head_pose_v2/${HEAD_CANDS[0]}head_pose_6dof.npz"
+        echo "  head pose: ${HEAD_CANDS[0]%/} (discovered)"
+    else
+        echo "expected exactly one head-pose directory ending in _${CLIP}, found ${#HEAD_CANDS[@]}:" >&2
+        printf '  %s\n' "${HEAD_CANDS[@]:-<none>}" >&2
+        echo "set HEAD_KEY=<key> explicitly to override" >&2
+        exit 1
+    fi
+fi
 if ! aws s3 cp "s3://${BUCKET}/${HEAD_KEY}" "$WORK/input/head_pose_6dof.npz"; then
     echo "no head pose at s3://${BUCKET}/${HEAD_KEY}" >&2
-    echo "set HEAD_KEY=<key> if this clip stores it elsewhere" >&2
     exit 1
 fi
 
