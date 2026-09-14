@@ -28,6 +28,7 @@ originals survive in `kp2d_raw` / `kp3d_cam_raw_pre` (smoothing) and `kp2d_preri
 """
 
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -58,31 +59,158 @@ def parse_args():
     p.add_argument('--out', required=True, help='output directory')
     p.add_argument('--stem', default=None, help='output stem (default: derived from --npz)')
     p.add_argument('--min-z', type=float, default=0.05,
-                   help='drop a detection if ANY joint is nearer than this (metres)')
+                   help='a detection needs repair if ANY joint is nearer than this (metres)')
+    p.add_argument('--max-bridge', type=int, default=90,
+                   help='widest two-sided depth interpolation, frames')
+    p.add_argument('--one-sided', type=int, default=10,
+                   help='a single-sided depth anchor is accepted only this close, frames')
     p.add_argument('--h', type=float, default=4.0, help='smoothing half-window, frames')
     p.add_argument('--order', type=int, default=2, help='smoothing polynomial order')
     p.add_argument('--rigid-h', type=float, default=16.0, help='pose-smoothing half-window, frames')
+    p.add_argument('--drop-instead-of-repair', action='store_true',
+                   help='old behaviour: delete unrepairable rows rather than bridging their depth')
     p.add_argument('--no-gate', action='store_true')
     p.add_argument('--no-smooth', action='store_true')
     p.add_argument('--no-rigidify', action='store_true')
     return p.parse_args()
 
 
-def gate_depth(src, dst, min_z):
-    """Drop detections with any joint at or behind `min_z`. Returns (n_in, n_kept)."""
+def find_sibling_3d(fused_path):
+    """The stage-1b npz next to the fused one. It carries EgoForce's own 2D head."""
+    hits = [p for p in glob.glob(os.path.join(os.path.dirname(fused_path), '*_3d_keypoints.npz'))]
+    return hits[0] if len(hits) == 1 else None
+
+
+def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
+    """Repair detections whose 3D lift failed, rather than deleting them.
+
+    An earlier version simply dropped any row with a joint nearer than `min_z`. That was wrong, and
+    the review of episode_048 showed why: over frames 1249-1306 EgoForce detected the right hand in
+    91/91 frames, but its wrist solved to -0.101 m - behind the lens - so the gate deleted 58
+    consecutive frames and left a 1.93 s hole in an otherwise continuous track.
+
+    Only the DEPTH was broken. The detection was fine: on the 369 bad rows of that clip, EgoForce's
+    own 2D head (`kp2d_head`, which is not derived from the 3D lift) puts 100% of joints on the image
+    and 100% inside the detector box, while the projection of the broken 3D manages 42% and 23%.
+    Throwing the row away discards good pixels to be rid of bad metres.
+
+    So: keep the 2D head, interpolate the per-joint depth from the nearest healthy rows of the same
+    hand, and back-project. The row is then labelled `lifted_2d` with `depth_measured=False`, which is
+    the mono-pipeline's existing vocabulary for exactly this - 2D we trust, depth we borrowed.
+
+    A row is repaired when either test fails, both physical rather than tuned:
+      * any joint nearer than `min_z`;
+      * the lift's wrist projects off the image while the head's wrist does not - a direct
+        self-contradiction. This is what produced the visible "sudden drift": rows that passed the
+        depth test, projected hundreds of pixels outside the frame, and snapped back.
+
+    Bridging follows the shape the reference study found (fusion/stabilise/PROVENANCE.md): two-sided
+    interpolation is better than one-sided at any gap length, so a single-sided anchor is accepted
+    only within `one_sided` frames. Beyond `max_bridge`, or with no anchor at all, the row is dropped
+    - depth cannot be invented from nothing.
+    """
     z = np.load(src, allow_pickle=True)
     n = len(z['frame_idx'])
-    keep = (z['kp3d_cam'][..., 2] >= min_z).all(1)
+    fr = z['frame_idx'].astype(int)
+    ir = z['is_right_wilor'].astype(int)
+    kp3 = z['kp3d_cam'].astype(float).copy()
+    K = np.asarray(z['K'], dtype=float)
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    W, H = int(z['width']), int(z['height'])
+
+    head = None
+    if sibling_3d and os.path.exists(sibling_3d):
+        s3 = np.load(sibling_3d, allow_pickle=True)
+        if 'kp2d_head' in s3.files:
+            lut = {(int(f), int(i)): h for f, i, h
+                   in zip(s3['frame_idx'], s3['is_right'], s3['kp2d_head'].astype(float))}
+            head = np.stack([lut.get((int(fr[r]), int(ir[r])), np.full((21, 2), np.nan))
+                             for r in range(n)])
+
+    lift2d = z['kp2d'].astype(float)
+    off = lambda p: (p[..., 0] < 0) | (p[..., 0] >= W) | (p[..., 1] < 0) | (p[..., 1] >= H)
+    bad = (kp3[..., 2] < min_z).any(1)
+    if head is not None:
+        contradiction = off(lift2d[:, 0]) & ~off(head[:, 0]) & ~np.isnan(head[:, 0, 0])
+        bad = bad | contradiction
+
+    stats = {'rows_in': n, 'bad': int(bad.sum()), 'repaired': 0, 'dropped': 0,
+             'no_head': 0, 'no_anchor': 0}
+    keep = np.ones(n, bool)
+
+    if head is not None:
+        for side in (0, 1):
+            rows = np.where(ir == side)[0]
+            if rows.size == 0:
+                continue
+            rows = rows[np.argsort(fr[rows])]
+            good = rows[~bad[rows]]
+            if good.size == 0:
+                keep[rows[bad[rows]]] = False
+                stats['no_anchor'] += int(bad[rows].sum())
+                continue
+            gf = fr[good]
+            for r in rows[bad[rows]]:
+                if np.isnan(head[r]).any():
+                    keep[r] = False
+                    stats['no_head'] += 1
+                    continue
+                f = fr[r]
+                pre = good[gf < f][-1] if (gf < f).any() else None
+                post = good[gf > f][0] if (gf > f).any() else None
+                # Pick the anchors once; depth and the 2D offset must use the SAME ones, or a row
+                # can take its depth from one end and its offset from both.
+                if pre is not None and post is not None and (fr[post] - fr[pre]) <= max_bridge:
+                    w = (f - fr[pre]) / max(fr[post] - fr[pre], 1)
+                    Zj = (1 - w) * kp3[pre, :, 2] + w * kp3[post, :, 2]
+                elif pre is not None and (f - fr[pre]) <= one_sided:
+                    Zj, post = kp3[pre, :, 2], None
+                elif post is not None and (fr[post] - f) <= one_sided:
+                    Zj, pre = kp3[post, :, 2], None
+                else:
+                    keep[r] = False
+                    stats['no_anchor'] += 1
+                    continue
+                # Use the head's pixels as they are. Correcting them by the head-vs-lift offset at
+                # the gap boundaries looked obviously right and measured worse, so it is recorded
+                # here rather than re-attempted. On episode_048, against this version's 123
+                # frame-to-frame jumps over 200 px and a bone-length CV of 0.0101:
+                #   per-joint offset  101 jumps, CV 0.0219, 18 tracks -> 29   (warps the skeleton)
+                #   one global offset 133 jumps, CV 0.0405                    (barely beats raw)
+                # The offset removes the boundary step but at the cost of the hand's own shape, and
+                # the smoother then fragments the track it was supposed to hold together.
+                u, v = head[r, :, 0], head[r, :, 1]
+                kp3[r] = np.stack([(u - cx) * Zj / fx, (v - cy) * Zj / fy, Zj], axis=-1)
+                stats['repaired'] += 1
+    else:
+        keep = ~bad
+        stats['no_head'] = int(bad.sum())
+
+    stats['dropped'] = int((~keep).sum())
     out = {}
     for k in z.files:
         v = z[k]
         row_keyed = (k not in NOT_ROW_KEYED and isinstance(v, np.ndarray)
                      and v.ndim >= 1 and v.shape[0] == n)
         out[k] = v[keep] if row_keyed else v
-    out['depth_gate_min_z'] = np.float32(min_z)
-    out['depth_gate_dropped'] = np.int32(n - int(keep.sum()))
+    out['kp3d_cam'] = kp3[keep].astype(np.float32)
+    # kp2d is the projection of kp3d, so a repaired row's 2D becomes its own head by construction.
+    P = kp3[keep]
+    out['kp2d'] = np.stack([P[..., 0] * fx / P[..., 2] + cx,
+                            P[..., 1] * fy / P[..., 2] + cy], axis=-1).astype(np.float32)
+    rep = bad[keep]
+    if 'source' in z.files:
+        src_arr = np.asarray(z['source']).astype(object)[keep]
+        src_arr[rep] = 'lifted_2d'
+        out['source'] = src_arr.astype(str)
+    if 'depth_measured' in z.files:
+        dm = np.asarray(z['depth_measured']).astype(bool)[keep]
+        dm[rep] = False
+        out['depth_measured'] = dm
+    out['depth_repaired'] = rep
+    out['repair_min_z'] = np.float32(min_z)
     np.savez_compressed(dst, **out)
-    return n, int(keep.sum())
+    return stats
 
 
 def metrics(path, min_z=0.05):
@@ -152,11 +280,18 @@ def main():
     cur = a.npz
 
     if not a.no_gate:
-        dst = os.path.join(tmpd, 'gated.npz')
-        n, kept = gate_depth(cur, dst, a.min_z)
-        print(f'  gate: kept {kept}/{n} ({100.0 * kept / n:.2f}%), dropped {n - kept}')
-        stats['stages'].append({'stage': 'depth_gate', 'rows_in': n, 'rows_out': kept,
-                                'dropped': n - kept, 'min_z_m': a.min_z})
+        dst = os.path.join(tmpd, 'repaired.npz')
+        sib = find_sibling_3d(a.npz)
+        if sib is None:
+            print('  repair: no sibling *_3d_keypoints.npz - falling back to DROPPING bad rows. '
+                  'Copy the 3D npz next to the fused one to enable repair.')
+        st = repair_rows(cur, dst, None if a.drop_instead_of_repair else sib,
+                         a.min_z, a.max_bridge, a.one_sided)
+        kept = st['rows_in'] - st['dropped']
+        print(f"  repair: {st['bad']} bad of {st['rows_in']} -> repaired {st['repaired']}, "
+              f"dropped {st['dropped']} (no anchor {st['no_anchor']}, no 2D head {st['no_head']}); "
+              f"kept {kept}/{st['rows_in']} ({100.0 * kept / st['rows_in']:.2f}%)")
+        stats['stages'].append({'stage': 'depth_repair', 'sibling_3d': sib, **st})
         cur = dst
 
     if not a.no_smooth:
@@ -178,6 +313,12 @@ def main():
     np.savez_compressed(final, **{k: v for k, v in np.load(cur, allow_pickle=True).items()})
     stats['after'] = metrics(final, a.min_z)
     stats['output'] = final
+    if stats['after']['rows'] > stats['before']['rows_clean']:
+        stats['motion_retention_caveat'] = (
+            "before/after are NOT the same row set: `before` is measured on rows that already "
+            "passed the depth test, while repair puts previously-failing rows back. Retention "
+            "above 100% is that changed denominator, not extra motion. The jitter and bone-CV "
+            "figures are unaffected - they are per-row properties.")
 
     sp = os.path.join(a.out, f'{stem}_stabilise_stats.json')
     with open(sp, 'w') as fh:
