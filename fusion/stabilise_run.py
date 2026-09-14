@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 
+import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +63,10 @@ def parse_args():
                    help='a detection needs repair if ANY joint is nearer than this (metres)')
     p.add_argument('--max-bridge', type=int, default=90,
                    help='widest two-sided depth interpolation, frames')
+    p.add_argument('--max-depth-jump', type=float, default=0.30,
+                   help='reject a repaired pose whose wrist depth moves further than this (m)')
+    p.add_argument('--max-reproj', type=float, default=40.0,
+                   help='reject a repaired pose whose median reprojection exceeds this (px)')
     p.add_argument('--one-sided', type=int, default=10,
                    help='a single-sided depth anchor is accepted only this close, frames')
     p.add_argument('--h', type=float, default=4.0, help='smoothing half-window, frames')
@@ -81,7 +86,8 @@ def find_sibling_3d(fused_path):
     return hits[0] if len(hits) == 1 else None
 
 
-def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
+def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10,
+                max_depth_jump=0.30, max_reproj=40.0, pad=80.0):
     """Repair detections whose 3D lift failed, rather than deleting them.
 
     An earlier version simply dropped any row with a joint nearer than `min_z`. That was wrong, and
@@ -94,9 +100,11 @@ def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
     and 100% inside the detector box, while the projection of the broken 3D manages 42% and 23%.
     Throwing the row away discards good pixels to be rid of bad metres.
 
-    So: keep the 2D head, interpolate the per-joint depth from the nearest healthy rows of the same
-    hand, and back-project. The row is then labelled `lifted_2d` with `depth_measured=False`, which is
-    the mono-pipeline's existing vocabulary for exactly this - 2D we trust, depth we borrowed.
+    So: take the root-relative hand SHAPE from the nearest healthy rows of the same hand, and solve a
+    rigid pose (cv2.solvePnP) that lands that shape on the observed 2D head. Bone lengths are correct
+    by construction - the shape is only rotated and translated, never stretched. The row is labelled
+    `lifted_2d` with `depth_measured=False`, the mono-pipeline's existing vocabulary for exactly this:
+    2D we trust, depth we did not measure.
 
     A row is repaired when either test fails, both physical rather than tuned:
       * any joint nearer than `min_z`;
@@ -104,10 +112,14 @@ def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
         self-contradiction. This is what produced the visible "sudden drift": rows that passed the
         depth test, projected hundreds of pixels outside the frame, and snapped back.
 
-    Bridging follows the shape the reference study found (fusion/stabilise/PROVENANCE.md): two-sided
-    interpolation is better than one-sided at any gap length, so a single-sided anchor is accepted
-    only within `one_sided` frames. Beyond `max_bridge`, or with no anchor at all, the row is dropped
-    - depth cannot be invented from nothing.
+    Every repaired pose must then survive four checks or the row is dropped after all: all joints in
+    front of `min_z`, wrist depth within `max_depth_jump` of the anchors, the hand on the image
+    (within `pad`), and median reprojection against the head under `max_reproj`. Repairing is not
+    allowed to be worse than deleting.
+
+    Two-sided anchors are preferred; a single-sided anchor is accepted only within `one_sided` frames,
+    following the reference study (fusion/stabilise/PROVENANCE.md). Beyond `max_bridge`, or with no
+    anchor, the row is dropped - a hand cannot be invented from nothing.
     """
     z = np.load(src, allow_pickle=True)
     n = len(z['frame_idx'])
@@ -135,7 +147,7 @@ def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
         bad = bad | contradiction
 
     stats = {'rows_in': n, 'bad': int(bad.sum()), 'repaired': 0, 'dropped': 0,
-             'no_head': 0, 'no_anchor': 0}
+             'no_head': 0, 'no_anchor': 0, 'pnp_failed': 0, 'rejected_pose': 0}
     keep = np.ones(n, bool)
 
     if head is not None:
@@ -158,29 +170,62 @@ def repair_rows(src, dst, sibling_3d, min_z, max_bridge=90, one_sided=10):
                 f = fr[r]
                 pre = good[gf < f][-1] if (gf < f).any() else None
                 post = good[gf > f][0] if (gf > f).any() else None
-                # Pick the anchors once; depth and the 2D offset must use the SAME ones, or a row
-                # can take its depth from one end and its offset from both.
                 if pre is not None and post is not None and (fr[post] - fr[pre]) <= max_bridge:
                     w = (f - fr[pre]) / max(fr[post] - fr[pre], 1)
-                    Zj = (1 - w) * kp3[pre, :, 2] + w * kp3[post, :, 2]
                 elif pre is not None and (f - fr[pre]) <= one_sided:
-                    Zj, post = kp3[pre, :, 2], None
+                    w, post = 0.0, None
                 elif post is not None and (fr[post] - f) <= one_sided:
-                    Zj, pre = kp3[post, :, 2], None
+                    w, pre = 1.0, None
                 else:
                     keep[r] = False
                     stats['no_anchor'] += 1
                     continue
-                # Use the head's pixels as they are. Correcting them by the head-vs-lift offset at
-                # the gap boundaries looked obviously right and measured worse, so it is recorded
-                # here rather than re-attempted. On episode_048, against this version's 123
-                # frame-to-frame jumps over 200 px and a bone-length CV of 0.0101:
-                #   per-joint offset  101 jumps, CV 0.0219, 18 tracks -> 29   (warps the skeleton)
-                #   one global offset 133 jumps, CV 0.0405                    (barely beats raw)
-                # The offset removes the boundary step but at the cost of the hand's own shape, and
-                # the smoother then fragments the track it was supposed to hold together.
-                u, v = head[r, :, 0], head[r, :, 1]
-                kp3[r] = np.stack([(u - cx) * Zj / fx, (v - cy) * Zj / fy, Zj], axis=-1)
+
+                # Take a VALID HAND from a neighbour and solve a rigid pose for it. Bone lengths are
+                # then correct by construction, because the shape is only rotated and translated.
+                #
+                # The first version of this back-projected the 2D head at per-joint interpolated
+                # depth. That gives 21 points at individually plausible depths which are not a hand:
+                # rigidify then fitted a rigid model to the wreckage and re-posed it, drawing a
+                # splayed fan from a point on the forearm at frame 30 and a hand on the floor at
+                # frame 90. It was shipped because bone-length CV measured *after* rigidify looked
+                # fine - but rigidify forces bone lengths consistent, so that number could not have
+                # detected the fault. The honest signal was bone_cv going INTO rigidify: 14.09%
+                # against v2's 6.22%. Never validate this stage on a post-rigidify statistic.
+                shp = None
+                if pre is not None and post is not None:
+                    a = kp3[pre] - kp3[pre, 0]
+                    b = kp3[post] - kp3[post, 0]
+                    shp = (1 - w) * a + w * b
+                elif pre is not None:
+                    shp = kp3[pre] - kp3[pre, 0]
+                else:
+                    shp = kp3[post] - kp3[post, 0]
+
+                ok_pnp, rvec, tvec = cv2.solvePnP(
+                    shp.astype(np.float64), head[r].astype(np.float64),
+                    K.astype(np.float64), None, flags=cv2.SOLVEPNP_EPNP)
+                if not ok_pnp:
+                    keep[r] = False
+                    stats['pnp_failed'] += 1
+                    continue
+                R, _ = cv2.Rodrigues(rvec)
+                cand = (shp @ R.T) + tvec.reshape(1, 3)
+
+                # Reject rather than ship a bad pose. Depth must be sane, the hand must land on the
+                # image, and it must not have teleported away from the anchors it was built from.
+                zref = ((1 - w) * kp3[pre, 0, 2] + w * kp3[post, 0, 2]) if (pre is not None and post is not None) \
+                    else (kp3[pre, 0, 2] if pre is not None else kp3[post, 0, 2])
+                uu = cand[:, 0] * fx / np.maximum(cand[:, 2], 1e-6) + cx
+                vv = cand[:, 1] * fy / np.maximum(cand[:, 2], 1e-6) + cy
+                if (cand[:, 2] < min_z).any() \
+                        or abs(cand[0, 2] - zref) > max_depth_jump \
+                        or ((uu < -pad) | (uu > W + pad) | (vv < -pad) | (vv > H + pad)).any() \
+                        or np.median(np.hypot(uu - head[r, :, 0], vv - head[r, :, 1])) > max_reproj:
+                    keep[r] = False
+                    stats['rejected_pose'] += 1
+                    continue
+                kp3[r] = cand
                 stats['repaired'] += 1
     else:
         keep = ~bad
@@ -286,10 +331,12 @@ def main():
             print('  repair: no sibling *_3d_keypoints.npz - falling back to DROPPING bad rows. '
                   'Copy the 3D npz next to the fused one to enable repair.')
         st = repair_rows(cur, dst, None if a.drop_instead_of_repair else sib,
-                         a.min_z, a.max_bridge, a.one_sided)
+                         a.min_z, a.max_bridge, a.one_sided,
+                         a.max_depth_jump, a.max_reproj)
         kept = st['rows_in'] - st['dropped']
         print(f"  repair: {st['bad']} bad of {st['rows_in']} -> repaired {st['repaired']}, "
-              f"dropped {st['dropped']} (no anchor {st['no_anchor']}, no 2D head {st['no_head']}); "
+              f"dropped {st['dropped']} (no anchor {st['no_anchor']}, no 2D head {st['no_head']}, "
+              f"pnp failed {st['pnp_failed']}, pose rejected {st['rejected_pose']}); "
               f"kept {kept}/{st['rows_in']} ({100.0 * kept / st['rows_in']:.2f}%)")
         stats['stages'].append({'stage': 'depth_repair', 'sibling_3d': sib, **st})
         cur = dst
