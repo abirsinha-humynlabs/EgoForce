@@ -13,9 +13,10 @@ Companion documents, deliberately not duplicated here:
 | **this file** | "What is it and why is it like this?" |
 
 **Status.** All code is written, linted and committed on `feat/egoforce-rtmpose-fusion`. The
-GPU-independent logic is covered by `fusion/selftest.py` (34 checks, passing). **No stage has been
-run on real footage** — there was no GPU on the development machine. §9 is the honest inventory of
-what that leaves unverified.
+GPU-independent logic is covered by `fusion/selftest.py` (34 checks, passing). **Both run types have
+now executed on real footage** (episode_047, episode_002) — see `plan_of_action.md` §2-§3 for what
+they produced and what it showed. §9 below was written before those runs; the MANO refit's
+convergence in particular is no longer untested, but its weights remain untuned.
 
 ---
 
@@ -532,7 +533,7 @@ produces good hands.
 | EgoForce inference | Needs CUDA + TensorRT + weights | Never executed end to end |
 | RTMPose inference | Needs mmpose + checkpoint | Call shape and BGR convention verified against source, never run |
 | MANO forward + refit convergence | Needs the MANO pkl files | **No optimisation step has ever been run.** The objective is written and differentiable by construction; whether 80 Adam iterations at lr 0.02 converge is unknown |
-| Refit weight defaults | No footage to tune on | Reasoned, not fitted. Expect to iterate — `plan_of_action.md` §5 lists what to watch |
+| Refit weight defaults | No footage to tune on | Reasoned, not fitted, and still untuned on real footage — `plan_of_action.md` §4 item 6 |
 | `--bbox-pad` | Untunable without running | Interacts with RTMPose's own `GetBBoxCenterScale` padding; EgoForce boxes may be tighter or looser than RTMPose expects |
 | `download_rtmpose_hand5.sh` | Not executed | URL and config name verified; which of its two routes fires is unknown |
 | Overlay encoders | Not exercised | ffmpeg h264 pipe with an OpenCV `mp4v` fallback |
@@ -618,4 +619,4 @@ python fusion/compare_runs.py --runs-root _DATA/runs --out _DATA/runs
 python demo/render_landmarks.py --video <uncalibrated.mp4> --duration-seconds 10
 ```
 
-Environment, weights and the GPU requirement: [`plan_of_action.md`](plan_of_action.md) §3.
+Environment, weights and the GPU requirement: [`plan_of_action.md`](plan_of_action.md) §2.
