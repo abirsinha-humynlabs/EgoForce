@@ -58,6 +58,8 @@ why it is shaped that way, the data contracts, and what was verified versus assu
 | Review overlays | `fusion/render_comparison.py`, `viz_delivery/render_v4_panels.py` | |
 | Self-test | `fusion/selftest.py` | **34/34 passing**, no GPU needed |
 | Run definitions | `run/` on `run/type1-egoforce-only` and `run/type2-fusion` | Each branch pins one run: script, manifest entry, README |
+| Stabilise stage | `fusion/stabilise/`, `fusion/stabilise_run.py` | **Run branches only.** Depth gate, zero-phase smooth, rigidify |
+| Delivery rebuild | `run/run_stabilised.sh`, `run/derive_type1.sh` | **Run branches only.** Re-deliver from an existing run; derive type 1 from type 2 without a GPU |
 
 ### Environment (done, 2026-09-11)
 
@@ -80,9 +82,13 @@ Delivered under `s3://…/labelling_results/hand_pose_EgoForce/` (the only prefi
 | `episode_047` | type1 v1/v2/v3, type2 v1/v2 |
 | `episode_002` | type1 v1/v2/v3, type2 v1/v2 |
 
-A **stabilise stage** was added outside this repo between v1 and v2 (`_stabilise_stats.json`:
-depth gate at z ≥ 0.05, temporal smooth, rigidify). It is not in `fusion/`; its outputs carry
-`kp2d_raw` / `kp3d_cam_raw_pre` so the pre-stabilisation values remain recoverable.
+A **stabilise stage** was added between v1 and v2 by the server-side work. It lives at
+`fusion/stabilise/` (+ `fusion/stabilise_run.py`, `run/run_stabilised.sh`) **on the two run
+branches, not on `feat/`** — merge a run branch to get it. It gates depths below 5 cm, applies a
+zero-phase temporal smooth, then rigidifies bone lengths, writing `_stabilise_stats.json`. Its
+outputs carry `kp2d_raw` / `kp3d_cam_raw_pre`, so pre-stabilisation values stay recoverable — which
+is what made the t ≈ 7 s analysis in §3.2 possible. `run/derive_type1.sh` additionally rebuilds a
+type 1 delivery from a type 2 run with no GPU.
 
 Separately, `episode_048` has a **HaWoR** run and a **MINT/ADAPT** run produced by other work, which
 §3 compares.
