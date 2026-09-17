@@ -1,10 +1,11 @@
 # Plan of action — EgoForce evaluation for the egocentric hand pipeline
 
-**Last updated:** 2026-09-10
+**Last updated:** 2026-09-17
 **Branch:** `feat/egoforce-rtmpose-fusion`
-**Status:** all code written and linted; GPU-independent logic self-tested. **Nothing has been run
-on real footage.** No GPU was available on the development machine (Apple M3, and EgoForce is
-hard-pinned to CUDA 12.6 + TensorRT).
+**Status:** GPU environment stood up and **both run types have executed on real footage**
+(episode_047, episode_002). EgoForce's geometry checks out; its *detection coverage* is the blocking
+defect. `episode_048` additionally has HaWoR and MINT/ADAPT runs, compared in §3.3. The head-to-head
+type 1 vs type 2 comparison the branches exist for has **not** been read yet — §4 item 4.
 
 ---
 
@@ -42,160 +43,148 @@ Everything is on `feat/egoforce-rtmpose-fusion`. [`fusion/README.md`](fusion/REA
 orientation; [`PIPELINE.md`](PIPELINE.md) is the design and engineering document — what was built,
 why it is shaped that way, the data contracts, and what was verified versus assumed.
 
+### Code
+
 | Component | File | Notes |
 | --- | --- | --- |
-| Landmark video/keypoint viewer | `demo/render_landmarks.py` | Standalone; AnyCalib intrinsics; for uncalibrated footage |
+| Landmark video/keypoint viewer | `demo/render_landmarks.py` | Standalone; AnyCalib intrinsics; uncalibrated footage |
 | EgoForce 3D producer | `fusion/run_egoforce_3d.py` | Drop-in for `run_wilor_3d.py`, identical npz schema |
 | RTMPose 2D producer | `fusion/run_rtmpose_2d.py` | Drop-in for `run_mediapipe_2d.py`, identical npz schema |
 | Articulated fusion | `fusion/fuse_egoforce_rtmpose.py`, `fusion/mano_refit.py` | Writes the mono-pipeline fused schema |
-| Metrics | `fusion/metrics.py` | Coverage, gaps, recovery, fragmentation, identity flips, depth/reprojection QC, labelled proxies |
+| Three delivery metrics | `fusion/evaluate_run.py` | M1 coverage/recovery, M2 geometric validity, M3 fingertip agreement (proxy) |
+| Diagnostics | `fusion/metrics.py` | Coverage, gaps, fragmentation, identity flips, depth/reprojection QC |
 | Comparison table | `fusion/compare_runs.py` | Recomputes from the fused npz so rigid and articulated land on the same axes |
 | Test matrix | `fusion/run_testcases.py`, `fusion/testcases.yaml` | `--dry-run` prints every command |
-| Review overlay | `fusion/render_comparison.py` | grey = EgoForce raw, colour = written, dots = RTMPose observation |
-| Self-test | `fusion/selftest.py` | **34/34 passing** |
-| RTMPose fetch | `scripts/download_rtmpose_hand5.sh` | Verified config name + checkpoint URL |
-| MANO params exposed | `demo/inference.py` | Purely additive keys; `run_app.py` / `run_aria.py` / `renderer.py` unaffected |
+| Review overlays | `fusion/render_comparison.py`, `viz_delivery/render_v4_panels.py` | |
+| Self-test | `fusion/selftest.py` | **34/34 passing**, no GPU needed |
+| Run definitions | `run/` on `run/type1-egoforce-only` and `run/type2-fusion` | Each branch pins one run: script, manifest entry, README |
+| Stabilise stage | `fusion/stabilise/`, `fusion/stabilise_run.py` | **Run branches only.** Depth gate, zero-phase smooth, rigidify |
+| Delivery rebuild | `run/run_stabilised.sh`, `run/derive_type1.sh` | **Run branches only.** Re-deliver from an existing run; derive type 1 from type 2 without a GPU |
 
-### Verified facts (checked, not assumed)
+### Environment (done, 2026-09-11)
 
-- **All three models share the same 21-keypoint order.** EgoForce's comes from `mano_joint_mapping`
-  in `models/mano_layer.py:33` plus fingertips appended thumb→pinky; RTMPose Hand5 trains against
-  mmpose's `coco_wholebody_hand.py`; MediaPipe matches. **No remapping anywhere.** `selftest.py`
-  asserts the derivation *and* asserts our edge list is byte-identical to the existing
-  `hand_topology.HAND_EDGES`, so the repos cannot drift silently.
-- **RTMPose-m Hand5:** config `rtmpose-m_8xb256-210e_hand5-256x256.py`, checkpoint
-  `rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.pth` (55 MB, URL returns 200),
-  256×256 input, 21 channels, reported 96.4 PCK@0.2 / 83.9 AUC / 5.06 EPE.
-- **It expects BGR** — its `data_preprocessor` sets `bgr_to_rgb=True`. The MediaPipe stage it
-  replaces needs RGB. Easy silent-accuracy-loss bug; handled.
-- **EgoForce needs no focal hack and no principal-point rebase.** Its ray-space solver consumes the
-  real intrinsics (`core/rss.py::unproject_unit_rays`), so anisotropic `fx≠fy` is supported instead
-  of being averaged to `f0`, and there is no image-centre assumption to undo.
-- **Handedness is structural, not guessed** — EgoForce runs separate left/right crop streams, so
-  `is_right` says which stream produced the row. This is the input the existing track-level
-  geometric handedness voting was built to repair.
+AWS `g5.xlarge`, Amazon Linux 2023, NVIDIA A10G 24 GB, driver **615.71.09** via `nvidia-open` from
+NVIDIA's `cuda-amzn2023` repo. Three things cost most of that day and are worth not rediscovering:
+
+- The EBS root volume ships at 20 GB and the conda env needs 30–45 GB. Grown to 80 GB.
+- **AL2023 uses versioned kernel package names.** The running 6.12 kernel needs `kernel6.12-devel`;
+  the generic `kernel-devel` tracks the 6.1 stream and conflicts with hundreds of lines of dnf noise.
+  Do not pass `--allowerasing` — that installs mismatched headers and the dkms build produces a
+  broken module.
+- The instance role could not read AWS's S3 driver bucket, so the NVIDIA dnf repo was used instead.
+
+### Runs completed
+
+Delivered under `s3://…/labelling_results/hand_pose_EgoForce/` (the only prefix these scripts write):
+
+| Clip | Runs |
+| --- | --- |
+| `episode_047` | type1 v1/v2/v3, type2 v1/v2 |
+| `episode_002` | type1 v1/v2/v3, type2 v1/v2 |
+
+A **stabilise stage** was added between v1 and v2 by the server-side work. It lives at
+`fusion/stabilise/` (+ `fusion/stabilise_run.py`, `run/run_stabilised.sh`) **on the two run
+branches, not on `feat/`** — merge a run branch to get it. It gates depths below 5 cm, applies a
+zero-phase temporal smooth, then rigidifies bone lengths, writing `_stabilise_stats.json`. Its
+outputs carry `kp2d_raw` / `kp3d_cam_raw_pre`, so pre-stabilisation values stay recoverable — which
+is what made the t ≈ 7 s analysis in §3.2 possible. `run/derive_type1.sh` additionally rebuilds a
+type 1 delivery from a type 2 run with no GPU.
+
+Separately, `episode_048` has a **HaWoR** run and a **MINT/ADAPT** run produced by other work, which
+§3 compares.
 
 ---
 
-## 3. Pending — in execution order
+## 3. What the runs showed
 
-### Step 1 — get a GPU box and install (blocking everything)
+### 3.1 EgoForce on episode_047 — the geometry is sound, the detection is not
 
-```bash
-conda create -n egoforce python=3.10 -y && conda activate egoforce
-bash scripts/install.sh                    # CUDA 12.6, torch 2.8, TensorRT, mmcv, pytorch3d, AnyCalib
-bash scripts/download_model_weights.sh     # _DATA/: model_weights.pth, detectors, MANO
-mim install "mmpose>=1.3.2"                # NOT in scripts/install.sh
-bash scripts/download_rtmpose_hand5.sh
-python fusion/selftest.py                  # must stay 34/34 in the real env
-```
+From `type1_egoforce_only_v2`:
 
-**GPU requirement.** An NVIDIA GPU with a CUDA 12.6-capable driver is mandatory:
-`demo/inference.py` imports `torch_tensorrt` at module scope and compiles both the detector and HALO;
-`scripts/install.sh` pins `torch==2.8.0+cu126` / `torch_tensorrt==2.8.0+cu126`. There is no macOS or
-CPU path. Per-frame work is small and fixed (RTMDet-tiny + a YOLO pose detector on the full frame,
-then HALO on four 224×224 crops), so VRAM is dominated by the TensorRT and inductor `max-autotune`
-compile rather than inference. The repo documents no VRAM figure; **~12 GB should be comfortable, but
-treat that as an estimate, not a measured requirement.** Expect a one-off compile before frame one.
+- **`reproj_median_px` = 2.6e-05.** The 3D and the stored `K` describe the same camera. The QC gate
+  passes and nothing downstream is invalidated by a calibration mismatch.
+- **`head_vs_lift_median_px` = 25.6 px.** EgoForce's own 2D keypoint head disagrees with its own 3D
+  lift by 26 px at the median. The lift is the less trustworthy half.
+- **Depth reached −0.419 m** — joints behind the camera. 11.5 % of joints sat below 5 cm. The v2
+  depth gate dropped 355 rows, of which 174 were right-hand rows whose shallowest joint had a median
+  of **−0.184 m**.
 
-The **articulated refit alone needs no GPU** — `fusion/mano_refit.py` is torch + smplx + the MANO
-files. Once the producer npz files exist, refit weights can be re-tuned on a laptop.
+**Coverage is the headline defect.** Right hand: 764 of 1823 frames lost across 124 gaps — **42 % of
+a 60.7 s clip**. Left hand: 343 frames (19 %). The right hand is the working hand (median wrist speed
+28.8 px/frame vs 5.8 left) and it is the one that fails.
 
-### Step 2 — choose the clips and fill in `fusion/testcases.yaml`
+### 3.2 The drift at t ≈ 7 s is detection dropout, not filter lag
 
-The shipped `clips:` block is placeholders and the runner refuses to start until it is edited.
-Intrinsics are **not** guessed: give `calib:` (a Standard Package `calibration.json`, read with the
-same schema handling as `run_clip.read_K`) or `K: [fx, fy, cx, cy]`.
-
-Pick clips where the **current pipeline visibly fails** — a comparison on clips that already work
-tells you nothing. Wanted:
-
-1. fast hand motion (tests recall and recovery delay)
-2. a hand gripping a tool, seen from the back (the case MediaPipe misses and the shape gate deletes)
-3. both hands crossing / two-handed manipulation (tests identity switches and duplicate suppression)
-4. **the clip that produced the foot false positive**
-5. a clip that currently produces missing output despite visible hands
-
-Then:
-
-```bash
-python fusion/run_testcases.py --config fusion/testcases.yaml --dry-run
-```
-
-Read the printed commands before spending GPU time. Confirm the clip paths, the `K` source and the
-frame windows are what you meant.
-
-### Step 3 — smoke-run one clip, one case
-
-```bash
-python fusion/run_testcases.py --config fusion/testcases.yaml --case T1_egoforce_only --clip <name>
-```
-
-Check, in this order:
-
-- `_3d_meta.json` → `reproj_median_px` **must be < 1 px**. If it is not, `kp3d_cam` and the stored
-  `K` describe different cameras and every downstream number is meaningless.
-- `_3d_meta.json` → `depth_Z_m.frac_below_5cm` should be ~0.
-- `_3d_meta.json` → `head_vs_lift_median_px`. This is new information: how far EgoForce's own 2D
-  keypoint head sits from its own 3D lift. A large value means the 3D lift is fighting the 2D head
-  and is worth understanding before trusting the fusion.
-- the `_3d_overlay.mp4` — does the skeleton sit on the hands at all?
-
-### Step 4 — run the matrix and read the comparison
-
-```bash
-python fusion/run_testcases.py --config fusion/testcases.yaml \
-    --mono-pipeline /path/to/hand_labelling_21kp
-```
-
-Produces `_DATA/runs/comparison.{csv,json,md}`. Read it in this order:
-
-1. **`T1` vs the current pipeline's own numbers** — did the model swap help?
-2. **`T2a` vs `T2b`** — did the *articulated* fusion help beyond the model swap? If `T2b` ≈ `T2a`,
-   the refit is not earning its complexity and should be dropped.
-3. **`T1c` vs `T1`** — if coverage jumps, the missing-hand work belongs in detection/association.
-4. **`bone_cv_med` and `refit_depth_change_m` on `T2b`** — if these grew, the refit is buying
-   reprojection accuracy by deforming the hand, and the gates need tightening.
-
-### Step 5 — tune the refit (no GPU needed)
-
-The defaults in `fusion/mano_refit.py::RefitWeights` are **reasoned but untuned**. Nothing has been
-fitted to real footage. Expect to iterate:
-
-| Knob | Default | What to watch |
+| Time | Frames | What happens |
 | --- | --- | --- |
-| `w_depth` | 250.0 | Load-bearing. 2D reprojection is scale–depth degenerate, so this is what keeps the fit metric. Lower it and depth will drift. |
-| `w_pose` / `w_orient` | 4.0 / 8.0 | Too high → the refit cannot fix the bent finger (the whole point). Too low → implausible poses. `T2c` probes this. |
-| `w_beta` | 2.0 | Guards bone lengths. Watch `bone_cv_med`. |
-| `min_conf` | 0.30 | RTMPose landmarks below this contribute nothing. Needs calibrating against RTMPose's actual confidence distribution on *this* footage. |
-| `max_bone_change` | 0.15 | Reject gate. If the reject rate is high, read the `refit.reasons` breakdown before loosening it. |
-| `iters` / `lr` | 80 / 0.02 | Convergence is unverified. Check `residual_px` vs `residual_px_init` actually falls. |
+| 6.10–6.27 s | 183–188 | Right hand tracks cleanly, 57–67 px/frame, depth steady ~0.31 m |
+| **6.27–6.63 s** | **189–198** | **333 ms blackout.** Reappears **336 px** away |
+| 6.67–6.87 s | 199–206 | Tracks again; depth climbs 0.29 → 0.41 m |
+| **6.87–7.23 s** | **207–216** | **Second 333 ms blackout.** Reappears **405 px** away |
+| 7.23 s on | 217+ | Hand slows; tracking settles to 3–13 px/frame |
 
-### Step 6 — hand back to the existing pipeline
+Confirmed as genuine **detector misses**, not the depth gate: the detector fired on **0 of 10** frames
+in each blackout, and the gate removed nothing in that window.
 
-The fused npz is in the mono-pipeline's schema, so tracking/filtering/handedness/overlay re-run on
-**CPU** with no changes to that repo:
+Two mechanisms, both measured:
 
-```bash
-python run_clip.py --from-npz <case>/<stem>_hand21_keypoints.npz \
-    --video <clip> --out <dir> --min-len 6 --foot-filter
-```
+1. **The hand is leaving the frame.** At frame 188 the wrist sat at u = 1783 on a 1920-wide image,
+   moving right at 57 px/frame — it exits in ~2.4 frames. Clip-wide, **47 % of the right hand's
+   ≥5-frame gaps begin within 250 px of a side edge** (left hand: 8 %).
+2. **Depth collapses with speed.** Median |ΔZ| per frame: 0.3 cm (<10 px/frame) → 0.6 → 1.0 →
+   **9.8 cm (>100 px/frame)**. A 30× degradation; 10 cm in 33 ms is solver failure, not hand motion.
 
-### Step 7 — only then, the things this evaluation cannot settle
+### 3.3 MINT/ADAPT vs HaWoR on episode_048
 
-- **Foot rejection: fine-tune the detector.** Feet, shoes and confusing objects as negatives, plus
-  difficult real hands as positives. No keypoint model is a semantic foot filter. `T2d` only tells
-  you whether the *choice* of detector matters.
-- **Real fingertip error needs annotation.** `fusion/metrics.py::fingertip_error` is written and
-  tested and takes a ground-truth array — it just has nothing to consume yet. Until then
-  `tip_disagree_px` is cross-model *disagreement*, which ranks variants but is not accuracy.
-- **Stereo (POEM-v2).** Out of scope here. Note EgoForce has **no stereo support at all** — for a
-  rectified stereo pair you would run it per view and get two independent estimates.
-- **Temporal model.** Only worth considering if jitter survives everything above.
+Full analysis and a rendered side-by-side video were produced locally — see §8.
+
+| | MINT/ADAPT | HaWoR |
+| --- | --- | --- |
+| rows backed by image evidence | 3277 (**89.9 %**) | 3628 (**99.5 %**) |
+| right hand, frames with evidence | 85.0 % | **99.3 %** |
+| bone-length CV (median) | **0.0051** | 0.0274 |
+| 2D acceleration median | **1.06 px** | 5.37 px |
+| negative Z / below 5 cm | 0 % / 0 % | 0 % / 0 % |
+
+**HaWoR wins evidence-backed coverage**, which is the one criterion post-processing cannot
+manufacture. **MINT wins stability — but the comparison is not apples-to-apples**: MINT/ADAPT is
+smoothed and rigidified, while HaWoR's metadata says `"postprocessing": "none - raw HaWoR output"`.
+Those two rows measure the ADAPT stage, not the model. No claim about underlying keypoint accuracy is
+supported by this data.
+
+**Trap worth knowing:** the two npz files **do not share a row order** — only **44.8 %** of rows carry
+the same handedness at the same index. Joining them by row position mismatches hands on more than half
+the rows and inflates apparent disagreement ~4× (117 px vs the true 26 px). Key on `(frame, hand)`.
 
 ---
 
-## 4. Untested surfaces — what could still be wrong
+## 4. Next steps, in order
+
+1. **Settle whether the t ≈ 7 s dropouts are the hand leaving frame or the detector failing on a
+   visible hand.** Extract frames 188–200 from `left_eye.mp4` and look. Edge proximity is strong
+   circumstantial evidence for the former but not proof, and it decides whether detector tuning is
+   worth anything here. Cheap, and it gates item 2.
+2. **Run `T1c`** (`--hand-conf 0.15 --max-misses 6`) on episode_047 and compare coverage against the
+   existing type1. `max_misses = 2` cannot bridge a 10-frame gap by construction. If coverage jumps,
+   the missing-hand work belongs in detection and association, not in the pose model.
+3. **Chase the depth-at-speed failure.** Negative Z and 9.8 cm/frame depth jumps originate in the ray
+   space solve, not the detector, and the stabilise stage only masks them by dropping rows.
+4. **Compare type 1 against type 2 head-to-head.** Both have run, but `fusion/evaluate_run.py` has
+   never been pointed at both with a shared `--rtmpose` reference, so M3 has not been read. This is
+   the comparison the whole branch structure exists for, and it is one command.
+5. **Re-do MINT vs HaWoR at the same processing level** — either put HaWoR through the stabilise
+   stage, or compare raw MINT (`kp3d_cam_raw_pre`, already in its npz) against raw HaWoR.
+6. **Tune the refit weights** (`fusion/mano_refit.py::RefitWeights`). Still untuned on real footage,
+   and it needs no GPU once the npz files exist.
+7. **Annotate ground truth** on a few difficult clips. `fusion/metrics.py::fingertip_error` is written
+   and tested and has nothing to consume; until then every accuracy statement is a proxy.
+8. **Foot false positives** — detector fine-tuning with feet and shoes as negatives. Unchanged from
+   the original plan, and no keypoint model substitutes for it.
+
+
+---
+
+## 5. Untested surfaces — what could still be wrong
 
 `fusion/selftest.py` covers topology, the stride-aware coverage/gap arithmetic, duplicate
 suppression, 2D/3D matching, projection maths, the Huber/weighted-median helpers and the
@@ -213,7 +202,7 @@ accept/reject accounting. It explicitly does **not** cover:
 
 ---
 
-## 5. Issues in `hand_labelling_21kp` that affect this comparison
+## 6. Issues in `hand_labelling_21kp` that affect this comparison
 
 Found by reading that code; **none are fixed here** (different repo, out of scope). They matter
 because they can make a good model look bad.
@@ -228,7 +217,7 @@ because they can make a good model look bad.
 
 ---
 
-## 6. Decisions taken, so they are not re-litigated
+## 7. Decisions taken, so they are not re-litigated
 
 - **Emit the mono-pipeline's exact npz schemas** rather than a new format. Cost: our stages inherit
   its vocabulary quirks (see §5). Benefit: `fuse_2d_3d.py`, `postprocess.py`, `render_overlay.py` and
@@ -253,7 +242,15 @@ because they can make a good model look bad.
 
 ---
 
-## 7. Quick reference
+## 8. Quick reference
+
+### Local analysis artefacts (deliberately not committed)
+
+`hand21kp/local_dump/` holds the episode_048 MINT-vs-HaWoR work: `comparison_report.md`,
+`comparison.json`, `per_keypoint.csv`, the rendered `episode_048_MINT_vs_HaWoR_sidebyside.mp4`
+(2560x774, 60.8 s), and re-runnable `compare_mint_vs_hawor.py` / `render_side_by_side.py`. It also
+carries `inputs/` with both npz files and the 264 MB source video, which is why it is gitignored
+rather than committed. Both scripts regenerate everything from `inputs/`.
 
 ```bash
 python fusion/selftest.py                                          # 34 checks, no GPU
