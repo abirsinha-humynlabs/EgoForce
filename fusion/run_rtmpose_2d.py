@@ -160,6 +160,39 @@ def detect_boxes(detector, frame_bgr, score_thr, cat_ids):
     return [(np.asarray(b, dtype=np.float32), -1) for b in bboxes[keep]]
 
 
+def init_pose_model(init_model, args):
+    """``init_model``, with ``weights_only=False`` forced for the checkpoint load only.
+
+    torch 2.6 flipped the default of ``torch.load(weights_only=...)`` from False to True. mmengine
+    0.10.7 - the version mmpose 1.3.2 pins - calls ``torch.load`` without the argument, so loading
+    the published RTMPose checkpoint fails: it carries numpy metadata, and
+    ``numpy.core.multiarray._reconstruct`` is not an allowed global under the new default.
+
+    Allowlisting with ``torch.serialization.add_safe_globals`` does NOT work here, which is why this
+    looks heavier-handed than it should. Under numpy 2.x ``numpy.core.multiarray`` is a shim
+    forwarding to ``numpy._core.multiarray``, so the object we would register resolves to a
+    different qualified name than the one pickled into the checkpoint (written under numpy 1.x).
+    The allowlist can never match, however many globals are added.
+
+    So this is a deliberate trust decision rather than a silent bypass, and it is narrow in three
+    ways: the patch is live only across this one call, it is restored in a ``finally``, and it
+    applies to a checkpoint whose provenance is fixed by scripts/download_rtmpose_hand5.sh - the
+    published artefact on download.openmmlab.com, fetched over HTTPS. Point --rtmpose-checkpoint at
+    an untrusted file and this becomes arbitrary code execution, which is precisely what the torch
+    default exists to prevent.
+    """
+    import functools
+
+    import torch
+
+    original = torch.load
+    torch.load = functools.partial(original, weights_only=False)
+    try:
+        return init_model(args.rtmpose_config, args.rtmpose_checkpoint, device=args.device)
+    finally:
+        torch.load = original
+
+
 def main():
     args = parse_args()
 
@@ -198,7 +231,7 @@ def main():
     from mmpose.apis import inference_topdown, init_model
 
     print(f'[2d {stem}] loading RTMPose-m Hand5 on {args.device}...')
-    pose_model = init_model(args.rtmpose_config, args.rtmpose_checkpoint, device=args.device)
+    pose_model = init_pose_model(init_model, args)
     detector = build_detector(args) if args.boxes == 'mmdet' else None
 
     writer = None

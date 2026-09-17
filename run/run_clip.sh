@@ -71,10 +71,23 @@ python "$REPO/fusion/run_rtmpose_2d.py" \
     --overlay
 
 # ---------------------------------------------------------------- stage 2: articulated refit
+# MIN_KPT_CONF defaults to 0.20, not mano_refit.py's 0.30, because 0.30 was measured to be actively
+# harmful on this footage. RTMPose's per-joint confidence here has median exactly 0.300, so the
+# default gate sits on the median and discards half the landmarks; 409 detections were left with
+# ZERO usable landmarks, making the confidence-weighted reprojection term divide by sum(c)=0 and
+# producing NaN. That is precisely the refit's 410 `rejected_nonfinite` rows - the largest rejection
+# category was the gate starving the optimiser, not the optimiser failing.
+#
+# Swept on episode_047 (accepted refits out of 2885):
+#     0.30 -> 1745   0.25 -> 1896   0.20 -> 1960   0.15 -> 1904   0.10 -> 1848
+# An interior optimum: below 0.20 the extra low-confidence landmarks cost more in bone-change and
+# reprojection rejections than they win back. Re-measure per dataset - this is a property of
+# RTMPose's confidence distribution on THIS footage, not a universal constant.
 python "$REPO/fusion/fuse_egoforce_rtmpose.py" \
     --egoforce "$WORK/out/${CLIP}_3d_keypoints.npz" \
     --rtmpose  "$WORK/out/${CLIP}_2d_keypoints.npz" \
     --mode articulated \
+    --min-kpt-conf "${MIN_KPT_CONF:-0.20}" \
     --stem "$CLIP" \
     --out  "$WORK/out" \
     --video "$WORK/input/left_eye.mp4" --overlay
@@ -108,8 +121,16 @@ PY
 # what with_filter=false in the manifest entry selects.
 mkdir -p "$WORK/render"
 BUCKET="stage-humyn-egocentric-stereo-data"
-HEAD_KEY="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))[0]['head_key'])" "$REPO/run/manifest_entry.json")"
-aws s3 cp "s3://${BUCKET}/${HEAD_KEY}" "$WORK/input/head_pose_6dof.npz"
+# Derive the head-pose key from CLIP. Reading it out of manifest_entry.json (which pins one clip)
+# meant `CLIP=episode_048 ./run/run_clip.sh` silently fetched episode_047's head trajectory and
+# rendered another clip's hands against it - wrong panels, no error. The manifest entry stays as the
+# delivery record; it is not the source of truth for which head pose to fetch.
+HEAD_KEY="${HEAD_KEY:-labelling_results/6dof_head_pose_v2/home_${CLIP}/head_pose_6dof.npz}"
+if ! aws s3 cp "s3://${BUCKET}/${HEAD_KEY}" "$WORK/input/head_pose_6dof.npz"; then
+    echo "no head pose at s3://${BUCKET}/${HEAD_KEY}" >&2
+    echo "set HEAD_KEY=<key> if this clip stores it elsewhere" >&2
+    exit 1
+fi
 
 IMU_ARG=()
 if aws s3 cp "${S3_INPUT}imu_accel.csv" "$WORK/input/imu_accel.csv" >/dev/null 2>&1; then
